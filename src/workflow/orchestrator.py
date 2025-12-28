@@ -105,24 +105,38 @@ class TranslationOrchestrator:
         logger.info(f"Starting translation workflow for '{title}'")
         start_time = datetime.now()
         
+        # 尝试加载检查点
+        import hashlib
+        doc_id = hashlib.md5(input_text.encode()).hexdigest()[:8]
+        checkpoint_loaded = self._load_checkpoint(doc_id)
+        
         try:
             # 阶段1: 预处理
-            self.state.stage = "preprocessing"
-            preprocessing_start = datetime.now()
+            if not checkpoint_loaded:
+                self.state.stage = "preprocessing"
+                preprocessing_start = datetime.now()
+                
+                self.document = await self.preprocessor.run(input_text, title)
+                self.state.total_chunks = self.document.total_chunks
+            else:
+                logger.info(f"Checkpoint loaded, resuming from stage: {self.state.stage}")
+                preprocessing_start = datetime.now()
             
-            self.document = await self.preprocessor.run(input_text, title)
-            self.state.total_chunks = self.document.total_chunks
-            
-            self.state.preprocessing_time = (datetime.now() - preprocessing_start).total_seconds()
-            logger.info(f"Preprocessing completed: {self.document.total_chunks} chunks")
+            if not checkpoint_loaded:
+                self.state.preprocessing_time = (datetime.now() - preprocessing_start).total_seconds()
+                logger.info(f"Preprocessing completed: {self.document.total_chunks} chunks")
             
             # 阶段2: 术语提取
-            self.state.stage = "terminology"
-            terminology_start = datetime.now()
-            
-            await self._extract_terminology()
-            
-            self.state.terminology_time = (datetime.now() - terminology_start).total_seconds()
+            if not checkpoint_loaded or self.state.stage in ["preprocessing", "terminology"]:
+                self.state.stage = "terminology"
+                terminology_start = datetime.now()
+                
+                await self._extract_terminology()
+                
+                self.state.terminology_time = (datetime.now() - terminology_start).total_seconds()
+            else:
+                terminology_start = datetime.now()
+                logger.info("Skipping terminology extraction (already completed)")
             
             # 处理术语人工审核
             if enable_human_review:
@@ -132,12 +146,15 @@ class TranslationOrchestrator:
             self.state.stage = "translating"
             translation_start = datetime.now()
             
-            self.translation_result = TranslationResult(
-                result_id=f"result_{self.document.doc_id}",
-                doc_id=self.document.doc_id,
-                terminology_used=self.terminology_agent.get_terminology_for_translation()
-            )
+            # 如果没有从检查点加载，创建新的翻译结果
+            if not self.translation_result:
+                self.translation_result = TranslationResult(
+                    result_id=f"result_{self.document.doc_id}",
+                    doc_id=self.document.doc_id,
+                    terminology_used=self.terminology_agent.get_terminology_for_translation()
+                )
             
+            # 从上次中断位置继续翻译
             await self._translate_all_chunks()
             
             self.state.translation_time = (datetime.now() - translation_start).total_seconds()
@@ -262,7 +279,14 @@ class TranslationOrchestrator:
         terminology = self.terminology_agent.get_terminology_for_translation()
         total = len(self.document.chunks)
         
-        for i, chunk in enumerate(self.document.chunks):
+        # 从上次完成的位置继续
+        completed_chunks = len(self.translation_result.units)
+        start_index = completed_chunks
+        
+        if start_index > 0:
+            logger.info(f"Resuming translation from chunk {start_index + 1}/{total}")
+        
+        for i, chunk in enumerate(self.document.chunks[start_index:], start=start_index):
             self.state.current_chunk = i + 1
             self.state.progress = (i + 1) / total
             
@@ -409,13 +433,16 @@ class TranslationOrchestrator:
     
     def _save_checkpoint(self):
         """保存检查点"""
-        if not self.translation_result:
+        if not self.translation_result or not self.document:
             return
         try:
             import pickle
+            import hashlib
             checkpoint_dir = Path("data/checkpoints")
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            checkpoint_file = checkpoint_dir / f"{self.document.doc_id}_checkpoint.pkl"
+            # 使用内容哈希作为稳定ID
+            doc_hash = hashlib.md5(self.document.raw_content[:1000].encode()).hexdigest()[:8]
+            checkpoint_file = checkpoint_dir / f"{doc_hash}_checkpoint.pkl"
             
             checkpoint_data = {
                 "document": self.document,
